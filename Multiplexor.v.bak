@@ -1,0 +1,13 @@
+module multiplexor (
+
+input wire memoria,
+input wire ALU,
+input wire UnidadDeControl,
+output reg out_mux
+);
+
+always @(*)
+begin
+1'b0:out_mux
+1'b1:out_mux
+)
