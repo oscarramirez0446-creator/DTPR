@@ -1,0 +1,225 @@
+module DPTR(
+    input clk,
+    input rst
+);
+
+// Señales globales de retorno y control de saltos
+wire wb_RegWrite;
+wire [4:0]  wb_WriteReg;
+wire [31:0] WriteData;
+wire Jump;                               
+wire [31:0] jump_address;                
+
+// ================= ETAPA IF (FETCH) =================
+wire [31:0] if_pc_plus_4;
+wire [31:0] instruccion;
+wire [31:0] dir;                         
+wire [31:0] next_pc;                     
+
+// Contador de programa (PC)
+pc program_counter (
+    .clk(clk),
+    .addnew(next_pc),
+    .address(dir)
+);
+
+// Selección del próximo PC (Salto o PC+4)
+assign next_pc = (Jump) ? jump_address : if_pc_plus_4;
+assign if_pc_plus_4 = dir + 4;
+
+// Memoria de instrucciones
+MemoriaDeInstrucciones MI ( 
+    .dir(dir),
+    .Dsalida(instruccion)
+);
+
+// ================= BUFFER IF/ID =================
+wire [31:0] id_pc_plus_4;
+wire [31:0] id_instruccion;
+
+buffer_IF_ID buf_if_id (
+    .clk(clk), .rst(rst),
+    .pc_plus_4_in(if_pc_plus_4),     .instruction_in(instruccion),
+    .pc_plus_4_out(id_pc_plus_4),    .instruction_out(id_instruccion)
+);
+
+// ================= ETAPA ID (DECODE) =================
+// Separación de los campos de la instrucción
+wire [5:0] op    = id_instruccion[31:26];
+wire [4:0] rs    = id_instruccion[25:21];
+wire [4:0] rt    = id_instruccion[20:16];
+wire [4:0] rd    = id_instruccion[15:11];
+wire [5:0] funct = id_instruccion[5:0];
+
+wire RegWrite, MemToReg, MemWrite, MemRead, ALUSrc, RegDst;
+wire [2:0] ALUop; 
+wire [31:0] ReadData1, ReadData2, InmExt;
+
+// Cálculo de la dirección de salto incondicional
+assign jump_address = { id_pc_plus_4[31:28], id_instruccion[25:0], 2'b00 };
+
+// Unidad de control principal
+UnidadDeControl U_ctrl ( 
+    .op(op),
+    .MemToReg(MemToReg),
+    .RegWrite(RegWrite),
+    .MemToWrite(MemWrite), 
+    .MemToRead(MemRead),   
+    .ALUSrc(ALUSrc),
+    .RegDst(RegDst),
+    .ALUop(ALUop),
+    .Jump(Jump)                         
+);
+
+// Banco de registros
+BancoDeRegistros BR ( 
+    .clk(clk),  
+    .WE(wb_RegWrite),           
+    .AR1(rs),
+    .AR2(rt),
+    .AW(wb_WriteReg),           
+    .DW(WriteData),             
+    .DR1(ReadData1),       
+    .DR2(ReadData2)        
+);
+
+// Extensión de signo para inmediatos
+sign_extend sign_ext (
+    .in_16(id_instruccion[15:0]), 
+    .out_32(InmExt)
+);
+
+// ================= BUFFER ID/EX =================
+wire ex_RegWrite, ex_MemToReg, ex_MemWrite, ex_MemRead, ex_ALUSrc, ex_RegDst;
+wire [2:0]  ex_ALUop;                    
+wire ex_Branch;                          
+wire [31:0] ex_pc_plus_4, ex_ReadData1, ex_ReadData2, ex_InmExt;
+wire [4:0]  ex_rs, ex_rt, ex_rd;
+
+buffer_ID_EX buf_id_ex (
+    .clk(clk), .rst(rst),
+    .wb_regwrite_in(RegWrite), .wb_memtoreg_in(MemToReg),
+    .m_branch_in(1'b0),        .m_memread_in(MemRead),    .m_memwrite_in(MemWrite),
+    .ex_regdst_in(RegDst),     .ex_alusrc_in(ALUSrc),
+    .ex_aluop_in(ALUop),                                                            
+    .pc_plus_4_in(id_pc_plus_4),
+    .read_data1_in(ReadData1), .read_data2_in(ReadData2),
+    .imm_ext_in(InmExt),
+    .rs_in(rs),                .rt_in(rt),                .rd_in(rd),
+    
+    .wb_regwrite_out(ex_RegWrite), .wb_memtoreg_out(ex_MemToReg),
+    .m_branch_out(ex_Branch),      .m_memread_out(ex_MemRead),    .m_memwrite_out(ex_MemWrite),
+    .ex_regdst_out(ex_RegDst),     .ex_alusrc_out(ex_ALUSrc),
+    .ex_aluop_out(ex_ALUop),                                                        
+    
+    .pc_plus_4_out(ex_pc_plus_4),
+    .read_data1_out(ex_ReadData1), .read_data2_out(ex_ReadData2),
+    .imm_ext_out(ex_InmExt),
+    .rs_out(ex_rs),                .rt_out(ex_rt),                .rd_out(ex_rd)
+);
+
+// ================= ETAPA EX (EXECUTE) =================
+wire [31:0] MuxALU_B, ALU_Result;
+wire [4:0]  WriteReg_ex;
+wire [2:0]  ALU_Sel;
+wire Zero;
+wire [31:0] branch_target_ex;            
+
+// Cálculo de la dirección de salto condicional (Branch)
+assign branch_target_ex = ex_pc_plus_4 + (ex_InmExt << 2);
+
+// Control de la ALU
+ALU_Control A_ctrl ( 
+    .ALUop(ex_ALUop), 
+    .FNC(ex_InmExt[5:0]), 
+    .ALU_Sel(ALU_Sel)
+);
+
+// Multiplexor para el registro destino (rt o rd)
+Multiplexor5a1 MUX5b (                   
+    .ins_1(ex_rt), 
+    .ins_2(ex_rd), 
+    .select(ex_RegDst), 
+    .out_to_bank(WriteReg_ex)     
+);
+
+// Multiplexor para el segundo operando de la ALU
+MultiplexorDos MUX2 (                    
+    .A(ex_ReadData2), 
+    .B(ex_InmExt), 
+    .sel(ex_ALUSrc), 
+    .Y(MuxALU_B)       
+);
+
+// ALU principal
+ALU alu ( 
+    .A(ex_ReadData1), 
+    .B(MuxALU_B),
+    .ALUControl(ALU_Sel), 
+    .Resultado(ALU_Result), 
+    .Zero(Zero)             
+);
+
+// ================= BUFFER EX/MEM =================
+wire mem_RegWrite, mem_MemToReg, mem_MemWrite, mem_MemRead;
+wire mem_Branch, mem_Zero;
+wire [31:0] mem_BranchTarget;
+wire [31:0] mem_ALU_Result, mem_WriteData_Mem;
+wire [4:0]  mem_WriteReg;
+
+buffer_EX_MEM buf_ex_mem (
+    .clk(clk), .rst(rst),
+    .wb_regwrite_in(ex_RegWrite), .wb_memtoreg_in(ex_MemToReg),
+    .m_branch_in(ex_Branch),      .m_memread_in(ex_MemRead),    .m_memwrite_in(ex_MemWrite),
+    .branch_target_in(branch_target_ex),
+    .zero_in(Zero),
+    .alu_result_in(ALU_Result),   
+    .write_data_in(ex_ReadData2), 
+    .dest_reg_in(WriteReg_ex),
+    
+    .wb_regwrite_out(mem_RegWrite), .wb_memtoreg_out(mem_MemToReg),
+    .m_branch_out(mem_Branch),      .m_memread_out(mem_MemRead),    .m_memwrite_out(mem_MemWrite),
+    .branch_target_out(mem_BranchTarget),
+    .zero_out(mem_Zero),
+    .alu_result_out(mem_ALU_Result), 
+    .write_data_out(mem_WriteData_Mem),
+    .dest_reg_out(mem_WriteReg)
+);
+
+// ================= ETAPA MEM (MEMORY) =================
+wire [31:0] mem_ReadData_Mem;
+
+// Memoria de datos
+Memoria data_memory (
+    .clk(clk),
+    .WE(mem_MemWrite),
+    .addr(mem_ALU_Result),
+    .WD(mem_WriteData_Mem),
+    .RD(mem_ReadData_Mem)
+);
+
+// ================= BUFFER MEM/WB =================
+wire wb_MemToReg;
+wire [31:0] wb_ReadData_Mem, wb_ALU_Result;
+
+buffer_MEM_WB buf_mem_wb (
+    .clk(clk), .rst(rst),
+    .wb_regwrite_in(mem_RegWrite),       .wb_memtoreg_in(mem_MemToReg),
+    .read_data_mem_in(mem_ReadData_Mem), .alu_result_in(mem_ALU_Result),
+    .dest_reg_in(mem_WriteReg),
+    
+    .wb_regwrite_out(wb_RegWrite),       .wb_memtoreg_out(wb_MemToReg),
+    .read_data_mem_out(wb_ReadData_Mem), .alu_result_out(wb_ALU_Result),
+    .dest_reg_out(wb_WriteReg)
+);
+
+// ================= ETAPA WB (WRITE BACK) =================
+// Multiplexor para escribir en el banco de registros
+Multiplexor MUX ( 
+    .A(wb_ALU_Result), 
+    .B(wb_ReadData_Mem),
+    .sel(wb_MemToReg), 
+    .Y(WriteData) 
+);
+
+endmodule
